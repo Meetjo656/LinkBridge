@@ -93,7 +93,7 @@ def resolve_link(url: str) -> Dict[str, Any]:
     match_result = find_best_android_match(apple_meta, country=country)
 
     if match_result:
-        best_candidate, confidence = match_result
+        best_candidate, confidence, *rest = match_result
         return {
             "type": "app",
             "source": "ios",

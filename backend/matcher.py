@@ -1,11 +1,17 @@
+import json
 import re
 import urllib.request
-import json
-from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
-from google_play_scraper.constants.element import ElementSpecs
 from google_play_scraper import search
+from google_play_scraper.constants.element import ElementSpecs
+
+from rapidfuzz_matcher import (
+    calculate_confidence,
+    developer_similarity,
+    name_similarity,
+    normalize,
+)
 
 # Patch google_play_scraper's appId extraction for the top featured card
 if "appId" in ElementSpecs.SearchResultOnTop:
@@ -16,11 +22,72 @@ if "appId" in ElementSpecs.SearchResultOnTop:
         else u
     )
 
+CATEGORY_MAPPINGS = {
+    "navigation": ["travel & local", "maps & navigation", "auto & vehicles"],
+    "travel": ["travel & local", "navigation"],
+    "photo & video": ["photography", "video players & editors"],
+    "photography": ["photo & video"],
+    "productivity": ["productivity", "business", "tools"],
+    "business": ["business", "productivity"],
+    "social networking": ["social", "communication"],
+    "social": ["social networking", "communication"],
+    "music": ["music & audio"],
+    "entertainment": ["entertainment", "video players & editors"],
+    "finance": ["finance"],
+    "games": [
+        "game",
+        "action",
+        "adventure",
+        "arcade",
+        "board",
+        "card",
+        "casino",
+        "casual",
+        "educational",
+        "puzzle",
+        "racing",
+        "role playing",
+        "simulation",
+        "sports",
+        "strategy",
+        "trivia",
+        "word",
+    ],
+    "utilities": ["tools"],
+}
+
+
+def check_category_match(
+    ios_genres: List[str] | str | None, android_genre: Optional[str]
+) -> bool:
+    """Check whether iOS genres and Android genre match or belong to the same category group."""
+    if not ios_genres or not android_genre:
+        return False
+
+    if isinstance(ios_genres, str):
+        ios_genres = [ios_genres]
+
+    and_genre_lower = android_genre.lower()
+    for g in ios_genres:
+        g_lower = g.lower()
+        if g_lower == and_genre_lower or g_lower in and_genre_lower or and_genre_lower in g_lower:
+            return True
+
+        if g_lower in CATEGORY_MAPPINGS:
+            for mapped in CATEGORY_MAPPINGS[g_lower]:
+                if mapped in and_genre_lower:
+                    return True
+
+        if and_genre_lower in CATEGORY_MAPPINGS:
+            for mapped in CATEGORY_MAPPINGS[and_genre_lower]:
+                if mapped in g_lower:
+                    return True
+
+    return False
+
 
 def fetch_apple_metadata(app_id: str, country: str = "us") -> Optional[Dict[str, Any]]:
-    """
-    Fetch app metadata from Apple's iTunes Lookup API.
-    """
+    """Fetch app metadata from Apple's iTunes Lookup API."""
     url = f"https://itunes.apple.com/lookup?id={app_id}&country={country}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -47,9 +114,7 @@ def fetch_apple_metadata(app_id: str, country: str = "us") -> Optional[Dict[str,
 
 
 def search_android_candidates(query: str, country: str = "us", n_hits: int = 10) -> List[Dict[str, Any]]:
-    """
-    Search the Google Play Store for candidate apps matching the query.
-    """
+    """Search the Google Play Store for candidate apps matching the query."""
     if not query:
         return []
 
@@ -59,7 +124,6 @@ def search_android_candidates(query: str, country: str = "us", n_hits: int = 10)
         for r in raw_results:
             pkg = r.get("appId")
             if not pkg:
-                # Fallback package extraction if still empty
                 match = re.search(r"id=([a-zA-Z0-9_.]+)", str(r))
                 if match:
                     pkg = match.group(1)
@@ -82,110 +146,47 @@ def search_android_candidates(query: str, country: str = "us", n_hits: int = 10)
         return []
 
 
-def _normalize_corp(name: Optional[str]) -> str:
-    """Normalize corporate and developer names by removing entity types."""
-    if not name:
-        return ""
-    cleaned = name.lower()
-    cleaned = re.sub(r"[^\w\s]", "", cleaned)
-    suffixes = [
-        "llc",
-        "inc",
-        "corp",
-        "corporation",
-        "ltd",
-        "limited",
-        "co",
-        "technologies",
-        "software",
-        "gmbh",
-        "sa",
-        "srl",
-    ]
-    for suffix in suffixes:
-        cleaned = re.sub(rf"\b{suffix}\b", "", cleaned)
-    return " ".join(cleaned.split())
-
-
-def _normalize_title(title: Optional[str]) -> str:
-    """Normalize app title by removing punctuation and subtitles."""
-    if not title:
-        return ""
-    # Remove subtitles separated by common delimiters: -, :, |, etc.
-    main_title = re.split(r"[-:|–—]", title)[0]
-    cleaned = re.sub(r"[^\w\s]", "", main_title.lower())
-    return " ".join(cleaned.split())
-
-
 def calculate_match_score(
     ios_meta: Dict[str, Any], candidate: Dict[str, Any]
-) -> float:
+) -> Dict[str, Any]:
     """
-    Calculate confidence score between an iOS app and an Android candidate app.
-    Formula:
-      - Name similarity: 50%
-      - Developer similarity: 30%
-      - Category & Package heuristic: 20%
+    Calculate confidence score between an iOS app and an Android candidate app using RapidFuzz.
     """
     ios_name = ios_meta.get("app_name") or ""
     ios_dev = ios_meta.get("developer") or ""
     android_name = candidate.get("app_name") or ""
     android_dev = candidate.get("developer") or ""
-    android_pkg = candidate.get("package") or ""
 
-    norm_ios_name = _normalize_title(ios_name)
-    norm_and_name = _normalize_title(android_name)
+    ios_genres = ios_meta.get("genres") or []
+    if not ios_genres and ios_meta.get("primary_genre"):
+        ios_genres = [ios_meta["primary_genre"]]
+    android_genre = candidate.get("genre")
 
-    # 1. Name similarity (50%)
-    if norm_ios_name == norm_and_name:
-        name_sim = 1.0
-    elif norm_ios_name in norm_and_name or norm_and_name in norm_ios_name:
-        name_sim = max(0.9, SequenceMatcher(None, norm_ios_name, norm_and_name).ratio())
-    else:
-        name_sim = SequenceMatcher(None, norm_ios_name, norm_and_name).ratio()
+    category_match = check_category_match(ios_genres, android_genre)
 
-    # 2. Developer similarity (30%)
-    norm_ios_dev = _normalize_corp(ios_dev)
-    norm_and_dev = _normalize_corp(android_dev)
-    if norm_ios_dev and norm_and_dev:
-        if norm_ios_dev == norm_and_dev:
-            dev_sim = 1.0
-        elif norm_ios_dev in norm_and_dev or norm_and_dev in norm_ios_dev:
-            dev_sim = max(0.85, SequenceMatcher(None, norm_ios_dev, norm_and_dev).ratio())
-        else:
-            dev_sim = SequenceMatcher(None, norm_ios_dev, norm_and_dev).ratio()
-    else:
-        dev_sim = 0.5  # Neutral if developer metadata is missing
-
-    # 3. Category & Package heuristics (20%)
-    heuristics = 0.0
-    # Package name contains app name or developer
-    pkg_clean = android_pkg.lower().replace(".", "")
-    if norm_ios_name.replace(" ", "") in pkg_clean:
-        heuristics += 0.10
-    if norm_ios_dev.replace(" ", "") in pkg_clean:
-        heuristics += 0.10
-
-    # Strong match shortcut: exact/near-exact name and same verified developer
-    if name_sim >= 0.95 and dev_sim >= 0.95:
-        return 1.0
-
-    total_score = (name_sim * 0.50) + (dev_sim * 0.30) + heuristics
-    return min(1.0, round(total_score, 2))
+    metrics = calculate_confidence(
+        source_name=ios_name,
+        target_name=android_name,
+        source_developer=ios_dev,
+        target_developer=android_dev,
+        category_match=category_match,
+    )
+    return metrics
 
 
 def find_best_android_match(
     ios_meta: Dict[str, Any], country: str = "us", min_confidence: float = 0.50
-) -> Optional[Tuple[Dict[str, Any], float]]:
+) -> Optional[Tuple[Dict[str, Any], float, Dict[str, Any]]]:
     """
     Find the best matching Android app for the given iOS app metadata.
+    Returns (best_candidate, confidence, metrics_breakdown) if confidence >= min_confidence.
     """
     app_name = ios_meta.get("app_name")
     if not app_name:
         return None
 
-    # Query Play Store using the app's clean title
-    search_query = _normalize_title(app_name) or app_name
+    # Query Play Store using normalized app title
+    search_query = normalize(app_name) or app_name
     candidates = search_android_candidates(search_query, country=country, n_hits=10)
 
     if not candidates:
@@ -193,13 +194,14 @@ def find_best_android_match(
 
     scored_candidates = []
     for candidate in candidates:
-        score = calculate_match_score(ios_meta, candidate)
-        scored_candidates.append((candidate, score))
+        metrics = calculate_match_score(ios_meta, candidate)
+        score = metrics["confidence"]
+        scored_candidates.append((candidate, score, metrics))
 
     scored_candidates.sort(key=lambda x: x[1], reverse=True)
-    best_candidate, best_score = scored_candidates[0]
+    best_candidate, best_score, best_metrics = scored_candidates[0]
 
     if best_score < min_confidence:
         return None
 
-    return best_candidate, best_score
+    return best_candidate, best_score, best_metrics
