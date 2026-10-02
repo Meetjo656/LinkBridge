@@ -1,6 +1,7 @@
 import re
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+
+from matcher import fetch_apple_metadata, find_best_android_match
 
 # Regex pattern for Apple App Store / iTunes store URLs
 APP_STORE_REGEX = re.compile(
@@ -42,7 +43,6 @@ def parse_app_store_url(url: str) -> Optional[Dict[str, Any]]:
     if country:
         country = country.lower()
 
-    # Normalize human-readable app name from slug
     formatted_name = (
         app_name.replace("-", " ").title() if app_name else None
     )
@@ -60,7 +60,9 @@ def parse_app_store_url(url: str) -> Optional[Dict[str, Any]]:
 
 
 def resolve_link(url: str) -> Dict[str, Any]:
-    """Resolve an incoming URL using the App Store parser."""
+    """
+    Resolve an incoming iOS App Store URL by finding its matching Android counterpart.
+    """
     parsed_info = parse_app_store_url(url)
 
     if not parsed_info:
@@ -72,11 +74,47 @@ def resolve_link(url: str) -> Dict[str, Any]:
             "error": "The provided URL is not a valid Apple App Store URL.",
         }
 
+    app_id = parsed_info["app_id"]
+    country = parsed_info.get("country") or "us"
+
+    # Step 1: Fetch Apple metadata (App Name, Developer, Genres, etc.)
+    apple_meta = fetch_apple_metadata(app_id, country=country)
+    if not apple_meta:
+        # Fallback to URL-parsed name if network lookup fails
+        apple_meta = {
+            "app_id": app_id,
+            "app_name": parsed_info.get("formatted_name"),
+            "developer": None,
+        }
+
+    app_name = apple_meta.get("app_name") or parsed_info.get("formatted_name")
+
+    # Step 2: Search Android ecosystem & score candidate apps
+    match_result = find_best_android_match(apple_meta, country=country)
+
+    if match_result:
+        best_candidate, confidence = match_result
+        return {
+            "type": "app",
+            "source": "ios",
+            "status": "matched",
+            "app_id": str(app_id),
+            "app_name": app_name,
+            "target": {
+                "platform": "android",
+                "app_name": best_candidate["app_name"],
+                "package": best_candidate["package"],
+                "url": best_candidate["url"],
+            },
+            "confidence": confidence,
+        }
+
     return {
         "type": "app",
         "source": "ios",
-        "platform": "app_store",
-        "status": "success",
-        "url": url,
-        **parsed_info,
+        "status": "unmatched",
+        "app_id": str(app_id),
+        "app_name": app_name,
+        "target": None,
+        "confidence": 0.0,
     }
