@@ -49,9 +49,79 @@ class CreateLinkRequest(BaseModel):
     android_url: str
 
 
+class UniversalizeRequest(BaseModel):
+    url: Optional[str] = None
+    long_url: Optional[str] = None
+
+    @property
+    def target_url(self) -> str:
+        return (self.url or self.long_url or "").strip()
+
+
 @app.get("/health")
 def health_check():
     return {"service": "LinkBridge", "status": "Running"}
+
+
+@app.post("/universalize")
+def universalize(payload: UniversalizeRequest, request: Request, db: Session = Depends(get_db)):
+    """
+    Combined Endpoint for Keyboard Extension:
+    Resolves the incoming app link and generates a universal short link
+    in a single network request.
+    Input:
+        {"url": "https://apps.apple.com/..."} or {"long_url": "..."}
+    Output:
+        - When matched: {"status": "matched", "short_url": "https://...", "short_code": "...", "ios_url": "...", "android_url": "...", "app_name": "..."}
+        - When unsupported: {"status": "unsupported", "reason": "..."}
+    """
+    target = payload.target_url
+    if not target:
+        return {"status": "unsupported", "reason": "empty_url"}
+
+    resolved = resolve_link(target)
+    if resolved.get("status") != "matched":
+        return resolved
+
+    ios_url = resolved["ios_url"]
+    android_url = resolved["android_url"]
+
+    # Deduplicate: check if an identical mapping is already shortened
+    existing = (
+        db.query(ShortLink)
+        .filter(ShortLink.ios_url == ios_url, ShortLink.android_url == android_url)
+        .order_by(ShortLink.created_at.desc())
+        .first()
+    )
+    if existing:
+        code = existing.short_code
+    else:
+        for _ in range(10):
+            code = generate_short_code(5)
+            if not db.query(ShortLink).filter(ShortLink.short_code == code).first():
+                break
+        else:
+            raise HTTPException(status_code=500, detail="Could not generate unique short code")
+
+        link_record = ShortLink(
+            short_code=code,
+            ios_url=ios_url,
+            android_url=android_url,
+        )
+        db.add(link_record)
+        db.commit()
+
+    base_url = str(request.base_url).rstrip("/")
+    short_url = f"{base_url}/{code}"
+
+    return {
+        "status": "matched",
+        "short_code": code,
+        "short_url": short_url,
+        "ios_url": ios_url,
+        "android_url": android_url,
+        "app_name": resolved.get("app_name"),
+    }
 
 
 @app.post("/resolve")
@@ -246,7 +316,7 @@ def redirect_link(short_code: str, request: Request, db: Session = Depends(get_d
 @app.get("/", response_class=HTMLResponse)
 def keyboard_demo():
     """Interactive Keyboard Simulation for LinkBridge MVP (Part 6 & Part 7)."""
-    return """<!DOCTYPE html>
+    return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
