@@ -36,7 +36,7 @@ export class LinkBridgeKeyboard {
 
   /**
    * Executed when the user taps 🔗.
-   * Resolves the app equivalent, creates a short link, and replaces the URL in the text.
+   * Universalizes the app store link in a single network round-trip.
    */
   async convertLink(currentText) {
     const originalUrl = this.inspectText(currentText);
@@ -44,42 +44,31 @@ export class LinkBridgeKeyboard {
       throw new Error('No supported app store link found in text');
     }
 
-    // 1. POST /resolve
-    const resolveRes = await fetch(`${this.apiBaseUrl}/resolve`, {
+    // Single request to POST /universalize
+    const res = await fetch(`${this.apiBaseUrl}/universalize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ long_url: originalUrl }),
+      body: JSON.stringify({ url: originalUrl }),
     });
-    const resolveData = await resolveRes.json();
+    const data = await res.json();
 
-    if (resolveData.status !== 'matched') {
+    if (data.status !== 'matched') {
       return {
         success: false,
-        reason: resolveData.reason || 'unsupported',
+        reason: data.reason || 'unsupported',
         text: currentText,
       };
     }
 
-    // 2. POST /links
-    const linkRes = await fetch(`${this.apiBaseUrl}/links`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ios_url: resolveData.ios_url,
-        android_url: resolveData.android_url,
-      }),
-    });
-    const linkData = await linkRes.json();
-
-    // 3. Replace original link with Universal LinkBridge URL
-    const updatedText = currentText.replace(originalUrl, linkData.short_url);
+    // Replace original link with Universal LinkBridge URL
+    const updatedText = currentText.replace(originalUrl, data.short_url);
 
     return {
       success: true,
-      short_url: linkData.short_url,
-      short_code: linkData.short_code,
+      short_url: data.short_url,
+      short_code: data.short_code,
       updated_text: updatedText,
-      app_name: resolveData.app_name,
+      app_name: data.app_name,
     };
   }
 }

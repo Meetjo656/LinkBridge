@@ -3,24 +3,47 @@ import UIKit
 /**
  * LinkBridge iOS Custom Keyboard Extension (UIInputViewController)
  *
- * Implements the smart LinkBridge toolbar:
- * [ Translate | GIF | Clipboard | 🔗 ]
+ * Designed around textDocumentProxy's limited context:
+ * - Monitors text immediately preceding the insertion point (documentContextBeforeInput).
+ * - When an App Store link is detected, the 🔗 toolbar button activates.
+ * - Tapping 🔗 sends a single network request to POST /universalize.
+ * - Safely replaces the detected URL with the returned LinkBridge universal short link.
  *
- * Dumb keyboard, deterministic backend:
- * 1. Automatically inspects document text before/around cursor.
- * 2. If an App Store link (apps.apple.com) is detected, the 🔗 button lights up.
- * 3. User taps 🔗 -> Calls /resolve and /links -> Inserts LinkBridge universal link.
+ * State flow:
+ * [🔗 (idle/disabled)] -> App Store link detected -> [🔗 (active)]
+ *   -> Tap -> [⏳ (loading/prevent multi-tap)]
+ *   -> Response received -> Insert short URL -> [✓ (success)]
+ *   -> [🔗 (disabled until next link)]
  */
 class LinkBridgeKeyboardViewController: UIInputViewController {
 
-    private let apiBaseUrl = "http://127.0.0.1:8000" // or production https://linkbridge.app
+    // =========================================================================
+    // API BASE URL CONFIGURATION
+    // -------------------------------------------------------------------------
+    // 1. iOS Simulator (running on macOS with backend on localhost):
+    //    "http://127.0.0.1:8000"
+    //
+    // 2. Physical iPhone / Device Testing over local Wi-Fi:
+    //    "http://192.168.1.XX:8000" (replace XX with your computer's LAN IP)
+    //    Note: On a real iPhone, 127.0.0.1 refers to the iPhone itself. To reach
+    //    your development machine, specify your computer's local Wi-Fi IP.
+    //
+    // 3. Production Deployment (Public HTTPS):
+    //    "https://api.linkbridge.app"
+    // =========================================================================
+    private let apiBaseUrl = "http://192.168.1.XX:8000" // Configure for your testing environment
 
+    // UI Components
     private var toolbarView: UIStackView!
     private var linkButton: UIButton!
-    private var detectedUrl: String?
 
+    // State Tracking
+    private var detectedUrl: String?
+    private var isLoading = false
+
+    // App Store URL detection pattern
     private let appStoreRegex = try! NSRegularExpression(
-        pattern: "https?://(?:[a-zA-Z0-9-]+\\.)?apps\\.apple\\.com/[^\\s]+",
+        pattern: "https?://(?:[a-zA-Z0-9-]+\\.)?(?:apps|itunes)\\.apple\\.com/[^\\s]+",
         options: .caseInsensitive
     )
 
@@ -34,6 +57,8 @@ class LinkBridgeKeyboardViewController: UIInputViewController {
         inspectContext()
     }
 
+    // MARK: - UI Setup
+
     private func setupToolbar() {
         toolbarView = UIStackView()
         toolbarView.axis = .horizontal
@@ -46,13 +71,11 @@ class LinkBridgeKeyboardViewController: UIInputViewController {
         let clipboardBtn = createToolbarButton(title: "Clipboard")
 
         linkButton = UIButton(type: .system)
-        linkButton.setTitle("🔗", for: .normal)
         linkButton.titleLabel?.font = UIFont.systemFont(ofSize: 20)
-        linkButton.backgroundColor = UIColor.systemGray5
         linkButton.layer.cornerRadius = 8
-        linkButton.isEnabled = false
-        linkButton.alpha = 0.4
         linkButton.addTarget(self, action: #selector(didTapLinkButton), for: .touchUpInside)
+
+        setButtonState(.disabled)
 
         toolbarView.addArrangedSubview(translateBtn)
         toolbarView.addArrangedSubview(gifBtn)
@@ -77,94 +100,154 @@ class LinkBridgeKeyboardViewController: UIInputViewController {
         return btn
     }
 
+    // MARK: - Button State Machine
+
+    private enum ButtonVisualState {
+        case disabled
+        case active
+        case loading
+        case success
+    }
+
+    private func setButtonState(_ state: ButtonVisualState) {
+        switch state {
+        case .disabled:
+            isLoading = false
+            linkButton.setTitle("🔗", for: .normal)
+            linkButton.isEnabled = false
+            linkButton.alpha = 0.4
+            linkButton.backgroundColor = UIColor.systemGray5
+        case .active:
+            isLoading = false
+            linkButton.setTitle("🔗", for: .normal)
+            linkButton.isEnabled = true
+            UIView.animate(withDuration: 0.2) {
+                self.linkButton.alpha = 1.0
+                self.linkButton.backgroundColor = UIColor.systemBlue
+            }
+        case .loading:
+            isLoading = true
+            linkButton.setTitle("⏳", for: .normal)
+            linkButton.isEnabled = false
+            linkButton.alpha = 0.8
+            linkButton.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.6)
+        case .success:
+            isLoading = false
+            linkButton.setTitle("✓", for: .normal)
+            linkButton.isEnabled = false
+            UIView.animate(withDuration: 0.2) {
+                self.linkButton.alpha = 1.0
+                self.linkButton.backgroundColor = UIColor.systemGreen
+            }
+        }
+    }
+
+    // MARK: - Core Keyboard Logic
+
+    @objc private func didTapLinkButton() {
+        guard let url = detectedUrl, !isLoading else { return }
+        resolve(url: url)
+    }
+
+    /// 1. Inspect text immediately before cursor in documentContextBeforeInput.
     private func inspectContext() {
-        guard let proxy = textDocumentProxy as? UITextDocumentProxy,
-              let text = proxy.documentContextBeforeInput else {
-            setLinkButtonActive(false, url: nil)
+        // Prevent changing button state while network request is in flight
+        guard !isLoading else { return }
+
+        guard let text = textDocumentProxy.documentContextBeforeInput, !text.isEmpty else {
+            detectedUrl = nil
+            setButtonState(.disabled)
             return
         }
 
         let range = NSRange(location: 0, length: text.utf16.count)
-        if let match = appStoreRegex.firstMatch(in: text, options: [], range: range),
-           let matchRange = Range(match.range, in: text) {
+        let matches = appStoreRegex.matches(in: text, options: [], range: range)
+
+        // Find match immediately preceding or closest to the cursor
+        if let lastMatch = matches.last, let matchRange = Range(lastMatch.range, in: text) {
             let url = String(text[matchRange])
-            setLinkButtonActive(true, url: url)
+            detectedUrl = url
+            setButtonState(.active)
         } else {
-            setLinkButtonActive(false, url: nil)
+            detectedUrl = nil
+            setButtonState(.disabled)
         }
     }
 
-    private func setLinkButtonActive(_ active: Bool, url: String?) {
-        detectedUrl = url
-        linkButton.isEnabled = active
-        UIView.animate(withDuration: 0.2) {
-            self.linkButton.alpha = active ? 1.0 : 0.4
-            self.linkButton.backgroundColor = active ? UIColor.systemBlue : UIColor.systemGray5
+    /// 2. Call POST /universalize in a single network request.
+    private func resolve(url: String) {
+        setButtonState(.loading)
+
+        guard let endpoint = URL(string: "\(apiBaseUrl)/universalize") else {
+            setButtonState(.disabled)
+            return
         }
-    }
 
-    @objc private func didTapLinkButton() {
-        guard let originalUrl = detectedUrl else { return }
-
-        // 1. Call POST /resolve
-        resolveAndInsert(originalUrl: originalUrl)
-    }
-
-    private func resolveAndInsert(originalUrl: String) {
-        guard let resolveEndpoint = URL(string: "\(apiBaseUrl)/resolve") else { return }
-
-        var request = URLRequest(url: resolveEndpoint)
+        var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let payload = ["long_url": originalUrl]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        request.timeoutInterval = 8.0
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let self = self,
-                  let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let status = json["status"] as? String, status == "matched",
-                  let iosUrl = json["ios_url"] as? String,
-                  let androidUrl = json["android_url"] as? String else {
-                return
-            }
+        let body = ["url": url]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-            // 2. Call POST /links
-            self.createShortLink(originalUrl: originalUrl, iosUrl: iosUrl, androidUrl: androidUrl)
-        }.resume()
-    }
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
 
-    private func createShortLink(originalUrl: String, iosUrl: String, androidUrl: String) {
-        guard let linksEndpoint = URL(string: "\(apiBaseUrl)/links") else { return }
-
-        var request = URLRequest(url: linksEndpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let payload = ["ios_url": iosUrl, "android_url": androidUrl]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let self = self,
-                  let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let shortUrl = json["short_url"] as? String else {
+            guard
+                let data = data,
+                error == nil,
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let status = json["status"] as? String,
+                status == "matched",
+                let shortURL = json["short_url"] as? String
+            else {
+                DispatchQueue.main.async {
+                    // Revert to active if URL still present, else disabled
+                    self.inspectContext()
+                }
                 return
             }
 
             DispatchQueue.main.async {
-                self.replaceUrlInDocument(originalUrl: originalUrl, with: shortUrl)
+                self.setButtonState(.success)
+                self.insert(shortURL: shortURL)
+
+                // Brief success feedback before returning to idle
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                    self?.detectedUrl = nil
+                    self?.setButtonState(.disabled)
+                }
             }
         }.resume()
     }
 
-    private func replaceUrlInDocument(originalUrl: String, with shortUrl: String) {
+    /// 3. Safely replace original link text before cursor with short universal link.
+    private func insert(shortURL: String) {
+        guard let originalUrl = detectedUrl else {
+            textDocumentProxy.insertText(shortURL)
+            return
+        }
+
         let proxy = textDocumentProxy
 
-        // Delete previous characters matching originalUrl length and insert universal link
-        for _ in 0..<originalUrl.count {
-            proxy.deleteBackward()
+        // Delete text input units corresponding to the original URL
+        if let context = proxy.documentContextBeforeInput {
+            if context.hasSuffix(originalUrl) {
+                // Original URL is right at the cursor
+                for _ in 0..<originalUrl.utf16.count {
+                    proxy.deleteBackward()
+                }
+            } else if let matchRange = context.range(of: originalUrl, options: .backwards) {
+                // If trailing whitespace or characters were entered after the URL
+                let trailingChars = context[matchRange.upperBound...]
+                let totalUnitsToDelete = originalUrl.utf16.count + trailingChars.utf16.count
+                for _ in 0..<totalUnitsToDelete {
+                    proxy.deleteBackward()
+                }
+            }
         }
-        proxy.insertText(shortUrl)
-        self.setLinkButtonActive(false, url: nil)
+
+        proxy.insertText(shortURL)
     }
 }

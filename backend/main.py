@@ -682,46 +682,48 @@ def keyboard_demo():
 
       linkBtn.classList.remove('active');
       linkBtn.setAttribute('disabled', 'true');
+      linkBtn.textContent = '⏳';
       toast.className = 'status-toast';
-      toast.textContent = "Resolving equivalent...";
+      toast.textContent = "Universalizing app link...";
 
       try {
-        // Step 1: POST /resolve
-        const resolveRes = await fetch('/resolve', {
+        // Single call to POST /universalize
+        const res = await fetch('/universalize', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ long_url: originalUrl })
+          body: JSON.stringify({ url: originalUrl })
         });
-        const resolveData = await resolveRes.json();
+        const data = await res.json();
 
-        if (resolveData.status !== 'matched') {
+        if (data.status !== 'matched') {
+          linkBtn.textContent = '🔗';
           toast.className = 'status-toast warn';
-          toast.textContent = "No verified equivalent found (" + (resolveData.reason || 'unsupported') + ").";
+          toast.textContent = "No verified equivalent found (" + (data.reason || 'unsupported') + ").";
           updateState();
           return;
         }
 
-        // Step 2: POST /links
-        toast.textContent = "Generating Universal Link...";
-        const linkRes = await fetch('/links', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ios_url: resolveData.ios_url,
-            android_url: resolveData.android_url
-          })
-        });
-        const linkData = await linkRes.json();
+        // Show success state
+        linkBtn.textContent = '✓';
+        linkBtn.style.background = '#22c55e';
+        linkBtn.style.color = '#ffffff';
 
-        // Step 3: Replace in text field
-        const newText = currentText.replace(originalUrl, linkData.short_url);
+        // Replace original link with Universal LinkBridge URL
+        const newText = currentText.replace(originalUrl, data.short_url);
         input.value = newText;
-        updateState();
 
         toast.className = 'status-toast success';
-        toast.innerHTML = 'Universal link inserted: <a href="' + linkData.short_url + '" target="_blank" style="color:#60a5fa;text-decoration:underline;">' + linkData.short_url + '</a>';
+        toast.innerHTML = 'Universal link inserted: <a href="' + data.short_url + '" target="_blank" style="color:#60a5fa;text-decoration:underline;">' + data.short_url + '</a>';
+
+        setTimeout(() => {
+          linkBtn.textContent = '🔗';
+          linkBtn.style.background = '';
+          linkBtn.style.color = '';
+          updateState();
+        }, 1200);
       } catch (err) {
         console.error(err);
+        linkBtn.textContent = '🔗';
         toast.className = 'status-toast warn';
         toast.textContent = "Error converting link. Please try again.";
         updateState();
